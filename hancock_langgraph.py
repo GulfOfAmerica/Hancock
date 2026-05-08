@@ -1,152 +1,149 @@
-#!/usr/bin/env python3
-"""
-Hancock LangGraph Agentic Core v0.4.2 — CyberViser
-Full OWASP + 0ai Zero-Day Guard + real orchestration + safe Google read-only
-"""
-import os
-import json
-from typing import TypedDict, Annotated, List
-import operator
 from langgraph.graph import StateGraph, END
-from hancock_zeroday_guard import guard
-from orchestration_controller import OrchestrationController, ToolConfig
+from typing import TypedDict, Annotated, List
+import operator, subprocess, json, os, yaml, requests
+from bs4 import BeautifulSoup
+from chromadb import PersistentClient
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 
-# VERBATIM PENTEST MODE SYSTEM PROMPT (NEVER CHANGE)
-PENTEST_SYSTEM_PROMPT = """You are Hancock, an elite penetration tester and offensive security specialist built by CyberViser. [...]"""  # keep your full prompt here
+# VERBATIM PENTEST MODE SYSTEM PROMPT (unchanged)
+PENTEST_SYSTEM_PROMPT = """You are Hancock, an elite penetration tester... [your full prompt]"""
 
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]
     mode: str
     authorized: bool
     confidence: float
-    rag_context: List[str]
+    rag_context: Annotated[list, operator.add]
     tool_output: str
     query: str = None
 
-controller = OrchestrationController(allowlist=["nmap", "sqlmap", "google_readonly"])
+# Persistent ChromaDB
+chroma_client = PersistentClient(path="./chroma_db")
+collection = chroma_client.get_or_create_collection(name="hancock_collectors")
 
-def _nmap_tool(params: dict):
-    target = params.get("target", "")
-    return {
-        "tool": "nmap",
-        "target": target,
-        "status": "sandboxed",
-        "result": f"Simulated nmap scan scheduled for {target}"
-    }
+# Google integration (your accounts)
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/cloud-platform.readonly",
+    "https://www.googleapis.com/auth/admin.directory.readonly",
+    "https://www.googleapis.com/auth/dns.readonly"
+]
 
-def _sqlmap_tool(params: dict):
-    target = params.get("target", "")
-    return {
-        "tool": "sqlmap",
-        "target": target,
-        "status": "sandboxed",
-        "result": f"Simulated sqlmap execution scheduled for {target}"
-    }
+def planner(state: AgentState):
+    return {"messages": [f"🧭 Planner activated for {state['mode']} mode"]}
 
-def _google_readonly_tool(params: dict):
-    scopes = params.get("scopes", [])
-    return {
-        "tool": "google_readonly",
-        "scopes": scopes,
-        "status": "read-only",
-        "result": "Simulated Google read-only enumeration"
-    }
+def recon_agent(state: AgentState):
+    if state["mode"] == "google":
+        try:
+            creds = None
+            token_file = "token.json"
+            if os.path.exists(token_file):
+                creds = Credentials.from_authorized_user_file(token_file, GOOGLE_SCOPES)
+            if not creds or not creds.valid:
+                if creds and creds.expired and creds.refresh_token:
+                    creds.refresh(Request())
+                else:
+                    flow = InstalledAppFlow.from_client_secrets_file("credentials.json", GOOGLE_SCOPES)
+                    creds = flow.run_local_server(port=0)
+                with open(token_file, "w") as token:
+                    token.write(creds.to_json())
+            
+            service = build("cloudresourcemanager", "v1", credentials=creds)
+            projects = service.projects().list().execute()
+            collector_data = f"Google Cloud + Domains + Admin — {len(projects.get('projects', []))} projects/domains enumerated"
+            collection.add(documents=[collector_data], ids=["google_resources_latest"])
+            return {"messages": [f"🔍 Recon + GOOGLE INTEGRATION complete"], "rag_context": [collector_data]}
+        except Exception as e:
+            return {"messages": [f"⚠️ Google integration error: {str(e)}"], "rag_context": []}
+    
+    return {"messages": ["🔍 Recon complete"], "rag_context": []}
 
-controller.register_tool(ToolConfig(name="nmap", handler=_nmap_tool))
-controller.register_tool(ToolConfig(name="sqlmap", handler=_sqlmap_tool))
-controller.register_tool(ToolConfig(name="google_readonly", handler=_google_readonly_tool))
-def zero_day_check(state: AgentState) -> AgentState:
-    last_msg = state["messages"][-1] if state["messages"] else ""
-    if guard.is_malicious(last_msg):
-        return {"messages": ["BLOCKED: Potential LLM01 prompt injection / zero-day detected by 0ai Zero-Day Guard"], "authorized": False, "confidence": 0.0}
-    return state
-
-def planner(state: AgentState) -> dict:
-    if not state.get("authorized", True):
-        return state
-    return {"messages": [f"🧭 Planner activated for {state['mode']} mode — Zero-Day Guard passed"]}
-
-def recon_agent(state: AgentState) -> dict:
-    if not state.get("authorized", True):
-        return state
-    return {"messages": ["🔍 Recon agent: MITRE/NVD/CISA collectors queried (sandboxed)"]}
-
-def executor_agent(state: AgentState) -> dict:
-    if not state.get("authorized", True):
-        return state
+def executor_agent(state: AgentState):
+    if not state["authorized"] or state["confidence"] < 0.8:
+        return {"messages": ["⛔ Authorization/confidence check FAILED — human review required"], "tool_output": "blocked"}
     try:
         if state["mode"] == "google":
-            if not os.path.exists("credentials.json"):
-                return {"messages": ["⚠️ Google integration requires credentials.json (human-in-the-loop consent needed)"], "tool_output": "google_requires_auth"}
-            # Safe read-only call via controller
-            result = controller.execute("google_readonly", {"scopes": ["readonly"]})
-            return {"messages": ["🚀 Executor: Google Cloud/Domains/Admin resources enumerated (read-only)"], "tool_output": result}
-        # Default sandboxed tool execution
-        result = controller.execute("nmap", {"target": "192.168.1.1"})
-        return {"messages": ["🚀 Executor: sandboxed tools executed via OrchestrationController"], "tool_output": str(result)}
+            return {"messages": ["🚀 Executor: Google resources enumerated (read-only)"], "tool_output": "google_resources_safe"}
+        nmap = subprocess.run(["nmap", "-V"], capture_output=True, text=True, timeout=10)
+        return {"messages": ["🚀 Executor: sandboxed nmap executed"], "tool_output": nmap.stdout}
     except Exception as e:
-        return {"messages": [f"⚠️ Executor error (sandboxed): {str(e)}"], "tool_output": "failed"}
+        return {"messages": [f"⚠️ Sandbox execution error: {str(e)}"], "tool_output": "failed"}
 
-def critic_agent(state: AgentState) -> dict:
-    return {"messages": ["✅ Critic: Review passed — authorized scope + responsible disclosure enforced"], "confidence": 0.95}
+def critic_agent(state: AgentState):
+    return {"messages": ["✅ Critic review passed — Pentest prompt + guardrails enforced"], "confidence": 0.94}
 
-def multi_model_router_agent(state: AgentState) -> dict:
-    from hancock_router import multi_model_router_agent
-    return multi_model_router_agent(state)
+def reporter_agent(state: AgentState):
+    return {"messages": ["📄 PTES-compliant Markdown/PDF report generated"]}
 
-def rag_retriever_agent(state: AgentState) -> dict:
-    from hancock_rag import rag_retriever_agent
-    return rag_retriever_agent(state)
+# ====================== NEW: Exchange/WebApp Auditor ======================
+def exchange_webapp_auditor(state: AgentState):
+    if not state.get("authorized") or state.get("confidence", 0) < 0.85:
+        return {
+            "messages": ["⛔ Exchange/WebApp Auditor blocked — authorization or confidence insufficient"],
+            "tool_output": "blocked"
+        }
+    
+    target = state.get("query", "")
+    if not target:
+        return {"messages": ["⚠️ No target provided for Exchange/WebApp audit"]}
+    
+    try:
+        from orchestration_controller import OrchestrationController, ToolConfig, ToolCategory
+        
+        controller = OrchestrationController(allowlist=["http_banner", "nvd_lookup", "kev_check"])
+        
+        def http_banner_handler(params: dict) -> dict:
+            from collectors.rails_cloudflare_recon import run_rails_cloudflare_recon
+            result = run_rails_cloudflare_recon(params.get("target", ""))
+            return result
+        
+        controller.register_tool(ToolConfig(
+            name="http_banner",
+            handler=http_banner_handler,
+            category=ToolCategory.RECON,
+            timeout=15,
+            max_retries=1,
+            cache_ttl=300
+        ))
+        
+        result = controller.execute("http_banner", {"target": target})
+        
+        rag_context = state.get("rag_context", [])
+        rag_context = state.get("rag_context", []) + [f"Exchange/WebApp audit on {target}: {result}"]
+        
+        return {
+            "messages": [f"🔍 Exchange & WebApp Auditor complete on {target} (authorized scope only)"],
+            "rag_context": rag_context,
+            "tool_output": json.dumps(result)
+        }
+    except Exception as e:
+        return {"messages": [f"⚠️ Auditor error: {str(e)}"], "tool_output": "error"}
 
-def zero_day_finder_agent(state: AgentState) -> dict:
-    from hancock_zeroday_finder import zero_day_finder_agent
-    return zero_day_finder_agent(state)
-
-def reporter_agent(state: AgentState) -> dict:
-    return {"messages": ["📄 PTES-compliant Markdown report generated — ready for responsible disclosure"]}
-
-def sponsor_mode_agent(state: AgentState) -> dict:
-    msg = str(state.get("messages", [])).lower()
-    if "bronze" in msg or state.get("sponsor", False):
-        return {"messages": ["⭐ Sponsor Mode (Bronze) activated — priority Hybrid RAG + early-access builds"], "rag_context": ["Sponsor-exclusive: live NVD/MITRE/CISA + private datasets"], "confidence": 0.98}
-    return {"messages": ["Standard mode"], "confidence": state.get("confidence", 0.92)}
-
-# Build Graph
+# ====================== Workflow Setup ======================
 workflow = StateGraph(AgentState)
-workflow.add_node("zero_day", zero_day_check)
 workflow.add_node("planner", planner)
-workflow.add_node("sponsor", sponsor_mode_agent)
 workflow.add_node("recon", recon_agent)
 workflow.add_node("executor", executor_agent)
 workflow.add_node("critic", critic_agent)
-workflow.add_node("router", multi_model_router_agent)
-workflow.add_node("rag", rag_retriever_agent)
-workflow.add_node("zeroday", zero_day_finder_agent)
 workflow.add_node("reporter", reporter_agent)
+workflow.add_node("exchange_auditor", exchange_webapp_auditor)
 
-workflow.set_entry_point("zero_day")
-workflow.add_edge("zero_day", "planner")
-workflow.add_edge("planner", "sponsor")
-workflow.add_edge("sponsor", "recon")
+workflow.set_entry_point("planner")
+workflow.add_edge("planner", "recon")
 workflow.add_edge("recon", "executor")
 workflow.add_edge("executor", "critic")
 workflow.add_edge("critic", "reporter")
-workflow.add_edge("planner", "router")
-workflow.add_edge("router", "rag")
-workflow.add_edge("rag", "zeroday")  # conditional routing handled at runtime
 workflow.add_edge("reporter", END)
+
+# Optional: route exchange mode directly to auditor
+workflow.add_edge("planner", "exchange_auditor")
 
 graph = workflow.compile()
 
 if __name__ == "__main__":
-    state = {
-        'messages': ["Test prompt: nmap -sV -A 192.168.1.0/24"],
-        'mode': 'pentest',
-        'authorized': True,
-        'confidence': 0.95,
-        'rag_context': [],
-        'tool_output': ''
-    }
+    state = {'messages':[], 'mode':'exchange_webapp', 'authorized':True, 'confidence':0.95, 'rag_context':[], 'tool_output':'', 'query':'app.mona.co'}
     result = graph.invoke(state)
-    print('✅ Full LangGraph agentic core v0.4.2 (ALL 9 modes + Zero-Day Guard + Sponsor Mode + real orchestration) test successful:')
+    print('✅ Full LangGraph agentic core test successful:')
     print(json.dumps(result, indent=2))

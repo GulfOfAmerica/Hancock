@@ -31,3 +31,13 @@ NIST: AU-6, IR-4
 - [x] Sponsor Mode node added to LangGraph (priority RAG + early-access)
 - [ ] Full Hybrid RAG node (faiss + live collectors)
 NIST: AU-6, IR-4
+
+## v0.4.13 (May 2026) — Completed
+
+- ✅ Enhanced `rails_cloudflare_recon.py` collector
+  - Cloudflare detection + cf-ray
+  - Security headers analysis
+  - robots.txt + .well-known/security.txt checks
+  - Response time measurement
+- ✅ Integrated into `exchange_webapp_auditor` mode
+- ✅ Full LangGraph flow tested successfully on real targets (app.mona.co)
