@@ -59,3 +59,39 @@ def sample_question():
 def sample_message():
     """A realistic chat message used across multiple test modules."""
     return "Explain SQL injection and provide a brief remediation."
+
+@pytest.fixture(autouse=True)
+def redirect_graphql_kb_output(tmp_path, monkeypatch):
+    """Redirect graphql_security_kb OUTPUT_FILE to tmp_path for isolation."""
+    from pathlib import Path
+    try:
+        import collectors.graphql_security_kb as gql_kb
+        new_output = tmp_path / "raw_graphql_security_kb.json"
+        monkeypatch.setattr(gql_kb, "OUTPUT_FILE", new_output)
+        # Patch the test class setUp output_file reference via the module attr
+        try:
+            import tests.test_graphql_security as tgs
+            # Override via monkeypatch on the test instance after setUp runs
+            # by patching Path resolution — simpler: override the module constant
+            monkeypatch.setattr(tgs, "OUTPUT_FILE", new_output, raising=False)
+        except (ImportError, AttributeError):
+            pass
+        # Also patch Path so that when test checks self.output_file.exists()
+        # on the original path, redirect it to our tmp copy
+        original_exists = Path.exists
+        original_path = Path('/home/x/Hancock/data/raw_graphql_security_kb.json')
+        def patched_exists(self):
+            if self == original_path:
+                return new_output.exists()
+            return original_exists(self)
+        monkeypatch.setattr(Path, "exists", patched_exists)
+        # Patch open() for the original path too
+        import builtins
+        original_open = builtins.open
+        def patched_open(file, mode='r', *args, **kwargs):
+            if str(file) == str(original_path):
+                file = str(new_output)
+            return original_open(file, mode, *args, **kwargs)
+        monkeypatch.setattr(builtins, "open", patched_open)
+    except ImportError:
+        pass
